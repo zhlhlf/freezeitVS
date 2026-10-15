@@ -37,7 +37,7 @@ env:
 jobs:
   # ---------------------------------------------------------------- 编译（两种触发都跑）
   build:
-    name: 编译 ARM64 + X64
+    name: 编译 ARM64
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -137,12 +137,15 @@ jobs:
           set -euo pipefail
           ZIP="$GITHUB_WORKSPACE/dist/${{ steps.ver.outputs.zip_name }}"
           test -f "$ZIP" || { echo "::error::缺少产物 $ZIP"; exit 1; }
-          for arch in ARM64 X64; do
-            f="magisk/freezeit${arch}"
-            test -f "$f" || { echo "::error::缺少二进制 $f"; exit 1; }
-            file "$f"
-            file "$f" | grep -q 'ARM aarch64\|x86-64' || { echo "::error::$f 架构异常"; exit 1; }
-          done
+          f="magisk/freezeitARM64"
+          test -f "$f" || { echo "::error::缺少二进制 $f"; exit 1; }
+          file "$f"
+          file "$f" | grep -q 'ARM aarch64' || { echo "::error::$f 架构异常"; exit 1; }
+          # 只发布 ARM64，包里不应出现 X64
+          if unzip -l "$ZIP" | grep -q 'freezeitX64'; then
+            echo "::error::面具包内不应包含 freezeitX64"
+            exit 1
+          fi
           unzip -l "$ZIP"
 
       - name: 上传 artifact

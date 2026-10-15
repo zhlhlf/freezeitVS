@@ -11,12 +11,9 @@ fi
 
 if [ "$ARCH" == "arm64" ];then
     mv "$MODPATH"/freezeitARM64 "$MODPATH"/freezeit
-    rm "$MODPATH"/freezeitX64
-elif [ "$ARCH" == "x64" ];then
-    mv "$MODPATH"/freezeitX64 "$MODPATH"/freezeit
-    rm "$MODPATH"/freezeitARM64
+    rm -f "$MODPATH"/freezeitX64
 else
-    abort "- 🚫 安装失败，仅支持ARM64或X64, 不支持当前架构: $ARCH"
+    abort "- 🚫 安装失败，仅支持ARM64, 不支持当前架构: $ARCH"
 fi
 
 chmod a+x "$MODPATH"/freezeit

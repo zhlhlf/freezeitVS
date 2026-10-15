@@ -45,7 +45,9 @@ compile() { # $1 = target triple, $2 = 输出文件名
 }
 
 compile aarch64-none-linux-android31 "${ID}ARM64"
-compile x86_64-none-linux-android31  "${ID}X64"
+
+# 只发布 ARM64；清掉可能残留的 X64 产物，避免被打进 zip
+rm -f "magisk/${ID}X64"
 
 cp -f changelog.txt magisk/changelog.txt
 
