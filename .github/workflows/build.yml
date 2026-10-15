@@ -87,26 +87,38 @@ jobs:
       - name: 获取配套 APP 的 APK
         working-directory: ${{ env.PROJECT_DIR }}
         env:
+          GH_TOKEN: ${{ github.token }}
           APK_URL: ${{ inputs.apk_url }}
           VERSION: ${{ steps.ver.outputs.version }}
+          APP_REPO: zhlhlf/freezeitapp
         run: |
           set -uo pipefail
+          # 优先级：仓库内已有 APK -> 手动 apk_url -> APP 仓最新 Release（公开 API，无需跨仓 token）
           if ls magisk/*.apk >/dev/null 2>&1; then
             echo "使用仓库内已有 APK"
           elif [ -n "${APK_URL:-}" ]; then
             echo "从 apk_url 下载"
             curl -fL --retry 3 -o "magisk/freezeit_${VERSION}_release.apk" "$APK_URL" || true
           else
-            echo "尝试从官方发布包提取同版本 APK"
-            ZIP_URL="https://raw.githubusercontent.com/jark006/freezeitRelease/main/freezeit_v${VERSION}.zip"
-            if curl -fL --retry 2 -o /tmp/upstream.zip "$ZIP_URL"; then
-              unzip -o -j /tmp/upstream.zip 'freezeit*.apk' -d magisk/ || true
+            echo "从 $APP_REPO 最新 Release 下载 APK"
+            # 注意：/releases/latest 会排除 pre-release，改用列表接口挑第一个带 .apk 的
+            # 带 token 可把 API 限额从 60/小时（匿名）提到 1000/小时
+            AUTH=()
+            [ -n "${GH_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_TOKEN")
+            if curl -fsSL --retry 3 ${AUTH[@]+"${AUTH[@]}"} \
+                 "https://api.github.com/repos/${APP_REPO}/releases?per_page=20" -o /tmp/app_rels.json; then
+              ASSET_URL="$(jq -r 'map(select(.draft==false)) | map(.assets[]? | select(.name|endswith(".apk"))) | .[0].browser_download_url // empty' /tmp/app_rels.json)"
+              echo "资产: ${ASSET_URL:-<无>}"
+              if [ -n "$ASSET_URL" ]; then
+                curl -fL --retry 3 -o "magisk/$(basename "$ASSET_URL")" "$ASSET_URL" || true
+              fi
             fi
           fi
           if ls magisk/*.apk >/dev/null 2>&1; then
             echo "✔ APK 就绪: $(ls magisk/*.apk)"
           else
-            echo "::warning::未取得 APK，模块仍可安装，但需手动安装配套 APP"
+            echo "::error::未取得配套 APP 的 APK，无法生成可自动安装的模块包"
+            exit 1
           fi
 
       - name: 编译并打包
