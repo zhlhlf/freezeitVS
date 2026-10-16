@@ -1,6 +1,7 @@
 name: Build
 
-# push          -> 只做测试编译（两个架构都编，产出 artifact，不发任何东西）
+# push          -> 只做测试编译（产出 artifact，不发任何东西）
+#                 配套 APP 的 APK 全自动从 zhlhlf/freezeitapp 的发布里取，无需手填地址
 # workflow_dispatch -> 测试编译 + 建 GitHub Release（手动触发）
 on:
   push:
@@ -12,10 +13,6 @@ on:
         description: '编译完成后创建 GitHub Release'
         type: boolean
         default: true
-      apk_url:
-        description: '可选：配套 APP 的 APK 直链（留空则自动抓取同版本发布包里的 APK）'
-        type: string
-        default: ''
       prerelease:
         description: '标记为 pre-release'
         type: boolean
@@ -84,42 +81,51 @@ jobs:
           ln -sfn "$NDK_CACHE" "$NDK_ROOT"
           "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version | head -1
 
-      - name: 获取配套 APP 的 APK
+      - name: 自动获取配套 APP 的 APK（最新 Release 或 pre-release）
         working-directory: ${{ env.PROJECT_DIR }}
         env:
           GH_TOKEN: ${{ github.token }}
-          APK_URL: ${{ inputs.apk_url }}
           VERSION: ${{ steps.ver.outputs.version }}
           APP_REPO: zhlhlf/freezeitapp
         run: |
           set -uo pipefail
-          # 优先级：仓库内已有 APK -> 手动 apk_url -> APP 仓最新 Release（公开 API，无需跨仓 token）
-          if ls magisk/*.apk >/dev/null 2>&1; then
-            echo "使用仓库内已有 APK"
-          elif [ -n "${APK_URL:-}" ]; then
-            echo "从 apk_url 下载"
-            curl -fL --retry 3 -o "magisk/freezeit_${VERSION}_release.apk" "$APK_URL" || true
-          else
-            echo "从 $APP_REPO 最新 Release 下载 APK"
-            # 注意：/releases/latest 会排除 pre-release，改用列表接口挑第一个带 .apk 的
-            # 带 token 可把 API 限额从 60/小时（匿名）提到 1000/小时
-            AUTH=()
-            [ -n "${GH_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_TOKEN")
-            if curl -fsSL --retry 3 ${AUTH[@]+"${AUTH[@]}"} \
-                 "https://api.github.com/repos/${APP_REPO}/releases?per_page=20" -o /tmp/app_rels.json; then
-              ASSET_URL="$(jq -r 'map(select(.draft==false)) | map(.assets[]? | select(.name|endswith(".apk"))) | .[0].browser_download_url // empty' /tmp/app_rels.json)"
-              echo "资产: ${ASSET_URL:-<无>}"
-              if [ -n "$ASSET_URL" ]; then
-                curl -fL --retry 3 -o "magisk/$(basename "$ASSET_URL")" "$ASSET_URL" || true
-              fi
-            fi
+          API="https://api.github.com/repos/${APP_REPO}/releases?per_page=30"
+          # /releases/latest 会排除 pre-release，所以只能用列表接口自己挑
+          # 带 token 可把 API 限额从 60/小时（匿名）提到 1000/小时；失败则退回匿名重试
+          AUTH=()
+          [ -n "${GH_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_TOKEN")
+          if ! curl -fsSL --retry 3 ${AUTH[@]+"${AUTH[@]}"} "$API" -o /tmp/app_rels.json; then
+            echo "带 token 请求失败，改用匿名"
+            curl -fsSL --retry 3 "$API" -o /tmp/app_rels.json || true
           fi
-          if ls magisk/*.apk >/dev/null 2>&1; then
-            echo "✔ APK 就绪: $(ls magisk/*.apk)"
-          else
-            echo "::error::未取得配套 APP 的 APK，无法生成可自动安装的模块包"
+          if [ ! -s /tmp/app_rels.json ]; then
+            echo "::error::无法获取 $APP_REPO 的 Release 列表"
             exit 1
           fi
+          echo "--- $APP_REPO 最近发布 ---"
+          jq -r '.[] | "\(.tag_name)\tpre=\(.prerelease)\tdraft=\(.draft)\t\(.published_at)"' /tmp/app_rels.json | head -10
+
+          # 选包：① 与模块同版本 tag（v$VERSION）且带 .apk；② 否则取最新（含 pre-release）且带 .apk
+          ASSET_URL="$(jq -r --arg v "v${VERSION}" '
+            map(select(.draft==false and .tag_name==$v))
+            | map(.assets[]? | select(.name|endswith(".apk")))
+            | .[0].browser_download_url // empty' /tmp/app_rels.json)"
+          if [ -n "$ASSET_URL" ]; then
+            echo "命中同版本发布 v${VERSION}"
+          else
+            echo "无 v${VERSION} 同版本包，改取最新（含 pre-release）"
+            ASSET_URL="$(jq -r '
+              map(select(.draft==false))
+              | sort_by(.created_at) | reverse
+              | map(.assets[]? | select(.name|endswith(".apk")))
+              | .[0].browser_download_url // empty' /tmp/app_rels.json)"
+          fi
+          echo "选中资产: ${ASSET_URL:-<无>}"
+          [ -n "$ASSET_URL" ] || { echo "::error::$APP_REPO 没有任何可用的 .apk 资产"; exit 1; }
+
+          rm -f magisk/freezeit*.apk
+          curl -fL --retry 3 -o "magisk/$(basename "$ASSET_URL")" "$ASSET_URL"
+          echo "✔ APK 就绪: $(ls -l magisk/*.apk)"
 
       - name: 编译并打包
         working-directory: ${{ env.PROJECT_DIR }}
