@@ -1,3 +1,4 @@
+# ==== MIUI_HYPEROS ====
 # 禁用 Millet
 persist.sys.gz.enable=false
 persist.sys.millet.handshake=false
@@ -10,3 +11,8 @@ persist.sys.mms.bg_apps_limit=256
 persist.sys.spc.enabled=false
 persist.sys.spc.extra_free_enable=false
 persist.sys.spc.screenoff_kill_enable=false
+
+# ==== COLOROS_OPLUS ====
+# 关闭 ColorOS 自带后台冻结 (hans), 后台管理交给冻它
+# 依据 /system_ext/etc/init/hans.rc: on property:sys.hans.enable=false -> stop hans
+persist.vendor.enable.hans=false
