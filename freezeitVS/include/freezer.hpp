@@ -53,10 +53,15 @@ private:
     map<int, long> lastNetEvent;        // uid -> 最近一次有效入站 TCP 数据时间
     map<int, long> lastNetLog;          // 日志节流
     map<int, long> lastNetUnfreeze;     // 解冻节流：连续事件不重复扫 /proc
-    set<int> netSeenUid;                // 首次收到有效网络事件时打一条日志
-    uint64_t netEventCnt = 0;           // data_len>0 的事件数
+    map<int, long> lastNetPacket;       // uid -> 最近一个 data_len>0 的包（任意大小）
+    map<int, long> netBurstBytes;       // uid -> 本轮连续收包累计字节，空闲后清零
+    set<int> netSeenUid;                // 首次达到 64KB 阈值时打一条日志
+    uint64_t netEventCnt = 0;           // 达到阈值的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
     static constexpr int NET_IDLE_SEC = 5;  // 最近这么久内有网络包就不冻结
+    // 单次入站 TCP 数据往往只有几百字节（推送/心跳/ACK）。累计超过 64KB
+    // 才认为真的在下载，才重置冻结倒计时；避免小包把应用永远吊住。
+    static constexpr long NET_ACTIVE_BYTES = 64 * 1024;
 
     int refreezeSecRemain = 60; //开机 一分钟时 就压一次
     int remainTimesToRefreshTopApp = 2; //允许多线程冲突，不需要原子操作
@@ -1327,12 +1332,25 @@ public:
                 return false;
             }
 
-            lastNetEvent[uid] = static_cast<long>(time(nullptr));
+            const long now = static_cast<long>(time(nullptr));
+            // 单包只有几百字节不算下载。按“连续收包的一轮”累计，
+            // 一轮里超过 64KB 才重置冻结倒计时；空闲超过 NET_IDLE_SEC 重新累计。
+            auto lastIt = lastNetPacket.find(uid);
+            if (lastIt == lastNetPacket.end() || now - lastIt->second > NET_IDLE_SEC)
+                netBurstBytes[uid] = 0;
+            lastNetPacket[uid] = now;
+
+            long& burst = netBurstBytes[uid];
+            burst += dataLen;
+            if (burst <= NET_ACTIVE_BYTES) return false;
+
+            burst = 0; // 达标后重新累计，下一次再攒 64KB
+            lastNetEvent[uid] = now;
             netEventCnt++;
             if (netSeenUid.insert(uid).second) {
-                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s data_len=%d",
+                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s 累计超过%ldKB",
                     managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
-                    uid, ipv6 ? "ipv6" : "ipv4", dataLen);
+                    uid, ipv6 ? "ipv6" : "ipv4", NET_ACTIVE_BYTES / 1024);
             }
             applyNetActivity(uid);
             return false;
