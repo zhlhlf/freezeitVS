@@ -885,8 +885,7 @@ public:
             appInfo.startTimestamp = time(nullptr);
 
             const int num = handleProcess(appInfo, false);
-            if (num > 0) freezeit.logFmt("☀️解冻 %s %d进程", appInfo.label.c_str(), num);
-            else freezeit.logFmt("😁启动 %s", appInfo.label.c_str());
+            if (num <= 0) freezeit.logFmt("😁启动 %s", appInfo.label.c_str());
         }
 
         for (const int uid : toBackgroundApp) { // 更新倒计时
@@ -1436,12 +1435,13 @@ public:
         if (curForegroundApp.contains(targetUid)) return isBinder;
         if (pendingHandleList.contains(targetUid)) return isBinder;
 
+        // 按用户要求：Binder 事件不再解冻，保持冻结状态。
+        // 只留一条 60 秒节流的日志，方便确认 Binder 通道在工作。
         const long now = static_cast<long>(time(nullptr));
         if (now - lastBinderWake[targetUid] < BINDER_WAKE_COOLDOWN_SEC) return isBinder;
         lastBinderWake[targetUid] = now;
 
-        unFreezerTemporary(targetUid);
-        freezeit.logFmt("Binder解冻 %s", appInfo.label.c_str());
+        freezeit.logFmt("Binder事件 %s（保持冻结）", appInfo.label.c_str());
         return isBinder;
     }
 
