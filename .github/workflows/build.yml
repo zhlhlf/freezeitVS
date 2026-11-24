@@ -1,0 +1,196 @@
+name: Build
+
+# push          -> 只做测试编译（产出 artifact，不发任何东西）
+#                 配套 APP 的 APK 全自动从 zhlhlf/freezeitapp 的发布里取，无需手填地址
+# workflow_dispatch -> 测试编译 + 建 GitHub Release（手动触发）
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+  workflow_dispatch:
+    inputs:
+      release:
+        description: '编译完成后创建 GitHub Release'
+        type: boolean
+        default: true
+      prerelease:
+        description: '标记为 pre-release'
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: r26d
+  NDK_CACHE: ${{ github.workspace }}/.ndk-cache
+  NDK_ROOT: ${{ github.workspace }}/.ndk
+  PROJECT_DIR: freezeitVS
+
+jobs:
+  # ---------------------------------------------------------------- 编译（两种触发都跑）
+  build:
+    name: 编译 ARM64
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      version_code: ${{ steps.ver.outputs.version_code }}
+      zip_name: ${{ steps.ver.outputs.zip_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读取模块版本
+        id: ver
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          prop() { sed -n "s/^$1=//p" magisk/module.prop | head -1 | tr -d '\r'; }
+          ID="$(prop id)"; VERSION="$(prop version)"; VC="$(prop versionCode)"
+          {
+            echo "version=$VERSION"
+            echo "version_code=$VC"
+            echo "zip_name=${ID}_v${VERSION}.zip"
+          } >> "$GITHUB_OUTPUT"
+          echo "模块 $ID  $VERSION ($VC)"
+
+      - name: 缓存 Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NDK_CACHE }}
+          key: ndk-${{ runner.os }}-${{ env.NDK_VERSION }}
+
+      - name: 安装 Android NDK ${{ env.NDK_VERSION }}
+        run: |
+          set -euo pipefail
+          if [ ! -x "$NDK_CACHE/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]; then
+            ZIP="android-ndk-${NDK_VERSION}-linux.zip"
+            curl -fL --retry 3 -o "$ZIP" \
+              "https://dl.google.com/android/repository/${ZIP}"
+            rm -rf "$NDK_CACHE"
+            # 直接从压缩包解出裸目录，省掉一层 mv
+            unzip -q "$ZIP" "android-ndk-${NDK_VERSION}/toolchains/*" -d "$NDK_CACHE.tmp"
+            mv "$NDK_CACHE.tmp/android-ndk-${NDK_VERSION}" "$NDK_CACHE"
+            rm -rf "$NDK_CACHE.tmp" "$ZIP"
+          fi
+          # clang++ 用 --sysroot 相对自身定位，可直接软链到固定的 NDK_ROOT
+          ln -sfn "$NDK_CACHE" "$NDK_ROOT"
+          "$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" --version | head -1
+
+      - name: 自动获取配套 APP 的 APK（最新 Release 或 pre-release）
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          APP_REPO: zhlhlf/freezeitapp
+        run: |
+          set -uo pipefail
+          API="https://api.github.com/repos/${APP_REPO}/releases?per_page=30"
+          # /releases/latest 会排除 pre-release，所以只能用列表接口自己挑
+          # 带 token 可把 API 限额从 60/小时（匿名）提到 1000/小时；失败则退回匿名重试
+          AUTH=()
+          [ -n "${GH_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GH_TOKEN")
+          if ! curl -fsSL --retry 3 ${AUTH[@]+"${AUTH[@]}"} "$API" -o /tmp/app_rels.json; then
+            echo "带 token 请求失败，改用匿名"
+            curl -fsSL --retry 3 "$API" -o /tmp/app_rels.json || true
+          fi
+          if [ ! -s /tmp/app_rels.json ]; then
+            echo "::error::无法获取 $APP_REPO 的 Release 列表"
+            exit 1
+          fi
+          echo "--- $APP_REPO 最近发布 ---"
+          jq -r '.[] | "\(.tag_name)\tpre=\(.prerelease)\tdraft=\(.draft)\t\(.published_at)"' /tmp/app_rels.json | head -10
+
+          # 选包：① 与模块同版本 tag（v$VERSION）且带 .apk；② 否则取最新（含 pre-release）且带 .apk
+          ASSET_URL="$(jq -r --arg v "v${VERSION}" '
+            map(select(.draft==false and .tag_name==$v))
+            | map(.assets[]? | select(.name|endswith(".apk")))
+            | .[0].browser_download_url // empty' /tmp/app_rels.json)"
+          if [ -n "$ASSET_URL" ]; then
+            echo "命中同版本发布 v${VERSION}"
+          else
+            echo "无 v${VERSION} 同版本包，改取最新（含 pre-release）"
+            ASSET_URL="$(jq -r '
+              map(select(.draft==false))
+              | sort_by(.created_at) | reverse
+              | map(.assets[]? | select(.name|endswith(".apk")))
+              | .[0].browser_download_url // empty' /tmp/app_rels.json)"
+          fi
+          echo "选中资产: ${ASSET_URL:-<无>}"
+          [ -n "$ASSET_URL" ] || { echo "::error::$APP_REPO 没有任何可用的 .apk 资产"; exit 1; }
+
+          rm -f magisk/freezeit*.apk
+          curl -fL --retry 3 -o "magisk/$(basename "$ASSET_URL")" "$ASSET_URL"
+          echo "✔ APK 就绪: $(ls -l magisk/*.apk)"
+
+      - name: 编译并打包
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          ANDROID_NDK_ROOT: ${{ env.NDK_ROOT }}
+        run: |
+          set -euo pipefail
+          chmod +x build_linux.sh
+          ./build_linux.sh "$GITHUB_WORKSPACE/dist"
+          ls -la "$GITHUB_WORKSPACE/dist"
+
+      - name: 校验产物
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/dist/${{ steps.ver.outputs.zip_name }}"
+          test -f "$ZIP" || { echo "::error::缺少产物 $ZIP"; exit 1; }
+          f="magisk/freezeitARM64"
+          test -f "$f" || { echo "::error::缺少二进制 $f"; exit 1; }
+          file "$f"
+          file "$f" | grep -q 'ARM aarch64' || { echo "::error::$f 架构异常"; exit 1; }
+          # 只发布 ARM64，包里不应出现 X64
+          if unzip -l "$ZIP" | grep -q 'freezeitX64'; then
+            echo "::error::面具包内不应包含 freezeitX64"
+            exit 1
+          fi
+          unzip -l "$ZIP"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ver.outputs.zip_name }}
+          path: dist/${{ steps.ver.outputs.zip_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 发布（仅手动触发）
+  release:
+    name: 创建 Release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.zip_name }}
+          path: dist
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          ZIP_NAME: ${{ needs.build.outputs.zip_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          ARGS=(--title "${VERSION}" --notes-file freezeitVS/changelog.txt)
+          [ "$PRERELEASE" = "true" ] && ARGS+=(--prerelease)
+          # 已存在同名 release 则覆盖资产，避免重复触发失败
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "dist/$ZIP_NAME" --clobber -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "dist/$ZIP_NAME" "${ARGS[@]}" -R "$GITHUB_REPOSITORY"
+          fi
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY"

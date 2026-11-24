@@ -31,13 +31,8 @@ if (-not$?)
     abort "Compiler ARM64 fail"
 }
 
-log "Compiler... X64"
-$target = "--target=x86_64-none-linux-android31"
-& $clang $target $sysroot $cppFlags.Split(' ') -Iinclude src/main.cpp -o magisk/${id}X64
-if (-not$?)
-{
-    abort "Compiler X64 fail"
-}
+# 只发布 ARM64；清掉可能残留的 X64 产物，避免被打进 zip
+Remove-Item "magisk/${id}X64" -ErrorAction SilentlyContinue
 
 Copy-Item changelog.txt magisk -force
 

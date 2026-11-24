@@ -11,12 +11,9 @@ fi
 
 if [ "$ARCH" == "arm64" ];then
     mv "$MODPATH"/freezeitARM64 "$MODPATH"/freezeit
-    rm "$MODPATH"/freezeitX64
-elif [ "$ARCH" == "x64" ];then
-    mv "$MODPATH"/freezeitX64 "$MODPATH"/freezeit
-    rm "$MODPATH"/freezeitARM64
+    rm -f "$MODPATH"/freezeitX64
 else
-    abort "- 🚫 安装失败，仅支持ARM64或X64, 不支持当前架构: $ARCH"
+    abort "- 🚫 安装失败，仅支持ARM64, 不支持当前架构: $ARCH"
 fi
 
 chmod a+x "$MODPATH"/freezeit
@@ -122,7 +119,18 @@ if [ "$MIUI_VersionCode" -ge 12 ] && [ "$MIUI_VersionCode" -le 14 ]; then
 elif [ "$HyperOS_VersionCode" -ge 1 ] && [ "$HyperOS_VersionCode" -le 6 ]; then
     echo "- 已配置禁用Millet参数  HyperOS $HyperOS_VersionCode"
 else
-    rm "$MODPATH"/system.prop
+    # 非 MIUI/HyperOS: 只去掉 MIUI 段, 保留 COLOROS_OPLUS 段 (persist.vendor.enable.hans)
+    # 用逐行过滤而不是 sed 区间删除, 避免 busybox sed 行为差异
+    sysPropTmp="$MODPATH"/system.prop.tmp
+    keepLine=1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "# ==== MIUI_HYPEROS ====") keepLine=0 ;;
+            "# ==== COLOROS_OPLUS ====") keepLine=1 ;;
+        esac
+        [ "$keepLine" = 1 ] && echo "$line"
+    done <"$MODPATH"/system.prop >"$sysPropTmp"
+    mv -f "$sysPropTmp" "$MODPATH"/system.prop
 fi
 
 echo ""

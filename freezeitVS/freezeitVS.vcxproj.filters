@@ -30,7 +30,6 @@
       <Filter>magisk</Filter>
     </None>
     <None Include="build_ARM64.ps1" />
-    <None Include="build_X64.ps1" />
     <None Include="README.md" />
   </ItemGroup>
   <ItemGroup>
