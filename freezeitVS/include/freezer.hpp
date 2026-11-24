@@ -66,6 +66,9 @@ private:
     static constexpr int NET_SYNC_SEC = 5;   // 每 5 秒核对一次订阅（应用可能刚启动/刚改配置）
     uint64_t netEventCnt = 0;           // 命中有效活动（入向大数据/疑似上传）的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
+    uint64_t netTcpSeen = 0;            // 收到的 TCP 网络事件（data_len>0）
+    uint64_t netUdpSeen = 0;            // 收到的 UDP 网络事件（data_len>0）
+    set<int> netUdpSeenUid;             // 首次收到某 UID 的 UDP 事件时打一条日志
     static constexpr int NET_IDLE_SEC = 5;  // 最近这么久内有网络包就不冻结
 
     // data_len 是单个 skb 的瞬时值，不做时间累积。正常下载的报文基本都是
@@ -835,8 +838,9 @@ public:
         }
 
         if(isReKernelConnected)
-            freezeit.logFmt("Re:Kernel上报次数 Binder[%d] 网络[%llu] 零长度[%llu] 监听[%d]",
+            freezeit.logFmt("Re:Kernel上报次数 Binder[%d] 触发[%llu] TCP事件[%llu] UDP事件[%llu] 零长度[%llu] 监听[%d]",
                 binderEventCnt, (unsigned long long)netEventCnt,
+                (unsigned long long)netTcpSeen, (unsigned long long)netUdpSeen,
                 (unsigned long long)netIgnoredZero, (int)netMonitored.size());
 
         stackString<64> tips;
@@ -1323,10 +1327,10 @@ public:
         }
     }
 
-    // 解析 "type=Network,target=<uid>,proto=ipv4|ipv6,data_len=<n>;"
-    // data_len 是单个 skb 的 TCP payload（GRO 合并后可能是 1404 的整数倍），
-    // 握手/纯 ACK 也会上报，此时为 0，不能算“正在下载”。
-    static bool parseNetEvent(const char* msg, int& uid, int& dataLen, bool& ipv6) {
+    // 解析 "type=Network,target=<uid>,proto=ipv4|ipv6,dir=in|out,l4=tcp|udp,data_len=<n>;"
+    // 旧版内核没有 dir/l4 字段，按入向 TCP 兼容处理。
+    static bool parseNetEvent(const char* msg, int& uid, int& dataLen, bool& ipv6,
+                              bool& udp, bool& outbound) {
         if (strncmp(msg, "type=Network", 12) != 0) return false;
         const char* p = strstr(msg, "target=");
         if (p == nullptr) return false;
@@ -1334,11 +1338,17 @@ public:
         uid = atoi(p + 7);
         dataLen = -1; // 旧版协议可能没有该字段，按“有活动”处理
         ipv6 = false;
+        udp = false;
+        outbound = false;
 
         p = strstr(msg, "data_len=");
         if (p != nullptr) dataLen = atoi(p + 9);
         p = strstr(msg, "proto=");
         if (p != nullptr && strncmp(p + 6, "ipv6", 4) == 0) ipv6 = true;
+        p = strstr(msg, "l4=");
+        if (p != nullptr && strncmp(p + 3, "udp", 3) == 0) udp = true;
+        p = strstr(msg, "dir=");
+        if (p != nullptr && strncmp(p + 4, "out", 3) == 0) outbound = true;
         return true;
     }
 
@@ -1348,14 +1358,24 @@ public:
         const bool isBinder = strncmp(msg, "type=Binder", 11) == 0;
 
         int uid = 0, dataLen = -1;
-        bool ipv6 = false;
-        if (parseNetEvent(msg, uid, dataLen, ipv6)) {
+        bool ipv6 = false, udp = false, outbound = false;
+        if (parseNetEvent(msg, uid, dataLen, ipv6, udp, outbound)) {
             if (uid <= 0) return false;
             // 全量广播的内核模块会把所有应用的包都发过来，这里只处理受管应用，
             // 避免首次事件日志和计数被系统应用刷屏。
             if (!managedApp.contains(uid) || !managedApp[uid].isSignalOrFreezer()) return false;
 
             const long now = static_cast<long>(time(nullptr));
+
+            // 统计所有 data_len>0 的事件（含未达到触发阈值的），用于确认 UDP 通道是否真的通了
+            if (dataLen > 0) {
+                if (udp) netUdpSeen++; else netTcpSeen++;
+                if (udp && netUdpSeenUid.insert(uid).second) {
+                    freezeit.logFmt("🌐UDP事件 %s uid=%d dir=%s data_len=%d",
+                        managedApp[uid].label.c_str(), uid,
+                        outbound ? "out" : "in", dataLen);
+                }
+            }
 
             // data_len=0：握手/纯 ACK。单看它不是下载，但上传时对端 ACK
             // 会让这个计数快速上涨，用窗口计数间接识别出方向流量。
@@ -1411,9 +1431,10 @@ public:
             lastNetEvent[uid] = now;
             netEventCnt++;
             if (netSeenUid.insert(uid).second) {
-                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s data_len=%d",
+                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s dir=%s l4=%s data_len=%d",
                     managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
-                    uid, ipv6 ? "ipv6" : "ipv4", dataLen);
+                    uid, ipv6 ? "ipv6" : "ipv4", outbound ? "out" : "in",
+                    udp ? "udp" : "tcp", dataLen);
             }
             applyNetActivity(uid);
             return false;

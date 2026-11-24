@@ -1,3 +1,8 @@
+### v3.3.6Alpha (genl)
+1. 日志区分 TCP/UDP 与方向：周期日志增加 TCP事件/UDP事件 计数，首次 UDP 事件打“🌐UDP事件 uid=… dir=… data_len=…”
+2. 首次触发日志增加 dir/l4 字段，便于确认 QQ 视频走的是 UDP
+3. 其余同 3.3.5
+
 ### v3.3.5Alpha (genl)
 1. Binder 事件不再解冻应用（按用户要求保持冻结），只保留 60 秒节流的 “Binder事件 …（保持冻结）” 日志
 2. 不再打印 “☀️解冻 N进程”，避免与 Binder/网络日志重复
