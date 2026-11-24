@@ -57,6 +57,9 @@ private:
     map<int, ZeroWin> netZeroWin;       // uid -> 零长度入向包窗口（疑似上传时的对端 ACK）
     set<int> netSeenUid;                // 首次命中有效事件时打一条日志
     set<int> netOutSeen;                // 首次命中“疑似上传”时打一条日志
+    set<int> netZeroSeen;               // 首次收到零长度事件时打一条日志（判断通道是否通）
+    long lastNetSummary = 0;            // 订阅摘要日志节流
+    static constexpr int NET_SYNC_SEC = 5;   // 每 5 秒核对一次订阅（应用可能刚启动/刚改配置）
     uint64_t netEventCnt = 0;           // 命中有效活动（入向大数据/疑似上传）的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
     static constexpr int NET_IDLE_SEC = 5;  // 最近这么久内有网络包就不冻结
@@ -1288,6 +1291,9 @@ public:
             if (genl.addMonitorNet(static_cast<uint32_t>(uid), &err)) {
                 netMonitored.insert(uid);
                 added++;
+                if (added <= 5)
+                    freezeit.logFmt("🌐监听已加 %s uid=%d",
+                        managedApp[uid].label.c_str(), uid);
             }
             else {
                 failed++;
@@ -1297,11 +1303,17 @@ public:
                         uid, err);
             }
         }
-        if (total == 0)
-            freezeit.log("Re:Kernel 网络监听: 没有可订阅的应用(需冻结/信号模式)");
-        else
-            freezeit.logFmt("Re:Kernel 网络监听 %d/%d 应用 (新增%d 取消%d 失败%d 错误码%d)",
-                (int)netMonitored.size(), total, added, removed, failed, lastSubError);
+
+        // 新增/取消/失败时立刻打；其余每 10 分钟报一次总数，免得 5 秒一条刷屏
+        const long now = static_cast<long>(time(nullptr));
+        if (added || removed || failed || total == 0 || now - lastNetSummary >= 600) {
+            lastNetSummary = now;
+            if (total == 0)
+                freezeit.log("Re:Kernel 网络监听: 没有可订阅的应用(需冻结/信号模式)");
+            else
+                freezeit.logFmt("Re:Kernel 网络监听 %d/%d 应用 (新增%d 取消%d 失败%d 错误码%d)",
+                    (int)netMonitored.size(), total, added, removed, failed, lastSubError);
+        }
     }
 
     // 解析 "type=Network,target=<uid>,proto=ipv4|ipv6,data_len=<n>;"
@@ -1339,6 +1351,11 @@ public:
             // 会让这个计数快速上涨，用窗口计数间接识别出方向流量。
             if (dataLen == 0) {
                 netIgnoredZero++;
+                if (netZeroSeen.insert(uid).second) {
+                    freezeit.logFmt("🌐零长度事件 %s uid=%d (握手/ACK，通道已通)",
+                        managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
+                        uid);
+                }
                 auto& w = netZeroWin[uid];
                 if (w.start == 0 || now - w.start >= NET_ZERO_WINDOW_SEC) {
                     w.start = now;
@@ -1404,6 +1421,7 @@ public:
             isReKernelConnected = true;
 
             netMonitored.clear();
+            netZeroSeen.clear();
             syncNetMonitor(genl);
 
             long lastSync = static_cast<long>(time(nullptr));
@@ -1414,14 +1432,16 @@ public:
                     freezeit.log("Re:Kernel(genl) 接收中断，稍后重连");
                     break;
                 }
-                if (n == 0) { // 超时，顺便同步新装/改配置的应用
-                    const long now = static_cast<long>(time(nullptr));
-                    if (now - lastSync >= 60) {
-                        lastSync = now;
-                        syncNetMonitor(genl);
-                    }
-                    continue;
+
+                // 不能只在 recv 超时时同步：设备上 Binder 事件是连续的，
+                // recv 永远等不到 30 秒超时，新启动的应用就永远进不了监听表。
+                const long now = static_cast<long>(time(nullptr));
+                if (now - lastSync >= NET_SYNC_SEC) {
+                    lastSync = now;
+                    syncNetMonitor(genl);
                 }
+
+                if (n == 0) continue;
                 if (handleReKernelEvent(msg))
                     binderEventCnt++;
             }
