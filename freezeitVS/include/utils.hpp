@@ -218,7 +218,10 @@ struct appInfoStruct {
         return freezeMode == FREEZE_MODE::FREEZER_BREAK || freezeMode == FREEZE_MODE::FREEZER;
     }
     bool isSignalOrFreezer() const {
-        return freezeMode <= FREEZE_MODE::SIGNAL && freezeMode < FREEZE_MODE::WHITELIST;
+        // 枚举顺序: TERMINATE=10, SIGNAL=20, SIGNAL_BREAK=21,
+        // FREEZER=30, FREEZER_BREAK=31, WHITELIST=40
+        // 这里要包含 SIGNAL*/FREEZER*，排除 TERMINATE（直接杀，不解冻）和 WHITELIST。
+        return freezeMode >= FREEZE_MODE::SIGNAL && freezeMode < FREEZE_MODE::WHITELIST;
     }
     bool isWhitelist() const {
         return freezeMode >= FREEZE_MODE::WHITELIST;

@@ -1,3 +1,8 @@
+### v3.3.3Alpha (genl)
+1. 修 isSignalOrFreezer() 判定方向写反：原为 freezeMode <= SIGNAL，只包含 TERMINATE/SIGNAL，把默认的 FREEZER(30)/SIGNAL_BREAK/FREEZER_BREAK 全排除了，导致订阅列表一直为空、网络事件也不生效
+2. 订阅列表为空时不再每 5 秒刷日志
+3. 其余同 3.3.2
+
 ### v3.3.2Alpha (genl)
 1. 适配全量广播版内核模块（双向 TCP/UDP、无需订阅）：只处理受管应用，忽略其它 UID，避免日志/计数被系统应用刷屏
 2. 其余同 3.3.1

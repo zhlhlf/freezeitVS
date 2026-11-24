@@ -1306,7 +1306,7 @@ public:
 
         // 新增/取消/失败时立刻打；其余每 10 分钟报一次总数，免得 5 秒一条刷屏
         const long now = static_cast<long>(time(nullptr));
-        if (added || removed || failed || total == 0 || now - lastNetSummary >= 600) {
+        if (added || removed || failed || now - lastNetSummary >= 600) {
             lastNetSummary = now;
             if (total == 0)
                 freezeit.log("Re:Kernel 网络监听: 没有可订阅的应用(需冻结/信号模式)");
