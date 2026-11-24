@@ -53,15 +53,22 @@ private:
     map<int, long> lastNetEvent;        // uid -> 最近一次有效入站 TCP 数据时间
     map<int, long> lastNetLog;          // 日志节流
     map<int, long> lastNetUnfreeze;     // 解冻节流：连续事件不重复扫 /proc
-    map<int, long> lastNetPacket;       // uid -> 最近一个 data_len>0 的包（任意大小）
-    map<int, long> netBurstBytes;       // uid -> 本轮连续收包累计字节，空闲后清零
-    set<int> netSeenUid;                // 首次达到 64KB 阈值时打一条日志
-    uint64_t netEventCnt = 0;           // 达到阈值的次数
+    struct ZeroWin { long start = 0; int cnt = 0; };
+    map<int, ZeroWin> netZeroWin;       // uid -> 零长度入向包窗口（疑似上传时的对端 ACK）
+    set<int> netSeenUid;                // 首次命中有效事件时打一条日志
+    set<int> netOutSeen;                // 首次命中“疑似上传”时打一条日志
+    uint64_t netEventCnt = 0;           // 命中有效活动（入向大数据/疑似上传）的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
     static constexpr int NET_IDLE_SEC = 5;  // 最近这么久内有网络包就不冻结
-    // 单次入站 TCP 数据往往只有几百字节（推送/心跳/ACK）。累计超过 64KB
-    // 才认为真的在下载，才重置冻结倒计时；避免小包把应用永远吊住。
-    static constexpr long NET_ACTIVE_BYTES = 64 * 1024;
+
+    // data_len 是单个 skb 的瞬时值，不做时间累积。正常下载的报文基本都是
+    // 1404/1440 的整 MSS（GRO 后是 2808、4212 的倍数），推送给付通常几百字节。
+    static constexpr int NET_EVENT_MIN_BYTES = 1024; // 单事件 >=1KB 才算在下载
+    // Re:Kernel 只上报入方向（LOCAL_IN）。出方向没有字节数可用，只能间接看：
+    // 上传时对端会持续回 ACK，这些是 data_len=0 的入向包。10 秒内 >=48 个
+    // 零长度包，约等于对端确认了 64KB 上传，此时也重置倒计时。
+    static constexpr int NET_ZERO_WINDOW_SEC = 10;
+    static constexpr int NET_ZERO_ACTIVE_CNT = 48;
 
     int refreezeSecRemain = 60; //开机 一分钟时 就压一次
     int remainTimesToRefreshTopApp = 2; //允许多线程冲突，不需要原子操作
@@ -1326,31 +1333,40 @@ public:
         if (parseNetEvent(msg, uid, dataLen, ipv6)) {
             if (uid <= 0) return false;
 
-            // 只统计入方向 TCP 的真实数据；data_len=0 是握手/纯 ACK，不算活动
+            const long now = static_cast<long>(time(nullptr));
+
+            // data_len=0：握手/纯 ACK。单看它不是下载，但上传时对端 ACK
+            // 会让这个计数快速上涨，用窗口计数间接识别出方向流量。
             if (dataLen == 0) {
                 netIgnoredZero++;
+                auto& w = netZeroWin[uid];
+                if (w.start == 0 || now - w.start >= NET_ZERO_WINDOW_SEC) {
+                    w.start = now;
+                    w.cnt = 0;
+                }
+                if (++w.cnt < NET_ZERO_ACTIVE_CNT) return false;
+
+                w.cnt = 0;
+                lastNetEvent[uid] = now;
+                netEventCnt++;
+                if (netOutSeen.insert(uid).second) {
+                    freezeit.logFmt("🌐疑似上传活动 %s uid=%d 10秒内零长度包≥%d",
+                        managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
+                        uid, NET_ZERO_ACTIVE_CNT);
+                }
+                applyNetActivity(uid);
                 return false;
             }
 
-            const long now = static_cast<long>(time(nullptr));
-            // 单包只有几百字节不算下载。按“连续收包的一轮”累计，
-            // 一轮里超过 64KB 才重置冻结倒计时；空闲超过 NET_IDLE_SEC 重新累计。
-            auto lastIt = lastNetPacket.find(uid);
-            if (lastIt == lastNetPacket.end() || now - lastIt->second > NET_IDLE_SEC)
-                netBurstBytes[uid] = 0;
-            lastNetPacket[uid] = now;
+            // 瞬时判定，不累积：单个 skb 的 payload 达到 1KB 就当作在传输。
+            if (dataLen < NET_EVENT_MIN_BYTES) return false;
 
-            long& burst = netBurstBytes[uid];
-            burst += dataLen;
-            if (burst <= NET_ACTIVE_BYTES) return false;
-
-            burst = 0; // 达标后重新累计，下一次再攒 64KB
             lastNetEvent[uid] = now;
             netEventCnt++;
             if (netSeenUid.insert(uid).second) {
-                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s 累计超过%ldKB",
+                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s data_len=%d",
                     managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
-                    uid, ipv6 ? "ipv6" : "ipv4", NET_ACTIVE_BYTES / 1024);
+                    uid, ipv6 ? "ipv6" : "ipv4", dataLen);
             }
             applyNetActivity(uid);
             return false;
