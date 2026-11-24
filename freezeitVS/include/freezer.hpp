@@ -55,6 +55,10 @@ private:
     map<int, long> lastNetUnfreeze;     // 解冻节流：连续事件不重复扫 /proc
     struct ZeroWin { long start = 0; int cnt = 0; };
     map<int, ZeroWin> netZeroWin;       // uid -> 零长度入向包窗口（疑似上传时的对端 ACK）
+    struct RateWin { long start = 0; int cnt = 0; };
+    map<int, RateWin> netRateWin;       // uid -> 1KB 以上包的短窗口计数
+    map<int, long> lastNetTrigger;      // uid -> 上次触发（同一秒只处理一次）
+    map<int, long> lastBinderWake;      // uid -> 上次 Binder 解冻，做冷却
     set<int> netSeenUid;                // 首次命中有效事件时打一条日志
     set<int> netOutSeen;                // 首次命中“疑似上传”时打一条日志
     set<int> netZeroSeen;               // 首次收到零长度事件时打一条日志（判断通道是否通）
@@ -66,7 +70,11 @@ private:
 
     // data_len 是单个 skb 的瞬时值，不做时间累积。正常下载的报文基本都是
     // 1404/1440 的整 MSS（GRO 后是 2808、4212 的倍数），推送给付通常几百字节。
-    static constexpr int NET_EVENT_MIN_BYTES = 1024; // 单事件 >=1KB 才算在下载
+    static constexpr int NET_EVENT_MIN_BYTES = 1024; // 参与速率统计的最小包
+    static constexpr int NET_BIG_EVENT_BYTES = 4096; // 单包 >=4KB（GRO 合并）直接算
+    static constexpr int NET_BURST_WINDOW_SEC = 3;   // 或 3 秒内 >=4 个 >=1KB 的包
+    static constexpr int NET_BURST_MIN_EVENTS = 4;
+    static constexpr int BINDER_WAKE_COOLDOWN_SEC = 60; // 同一 UID 的 Binder 解冻冷却
     // Re:Kernel 只上报入方向（LOCAL_IN）。出方向没有字节数可用，只能间接看：
     // 上传时对端会持续回 ACK，这些是 data_len=0 的入向包。10 秒内 >=48 个
     // 零长度包，约等于对端确认了 64KB 上传，此时也重置倒计时。
@@ -1378,8 +1386,28 @@ public:
                 return false;
             }
 
-            // 瞬时判定，不累积：单个 skb 的 payload 达到 1KB 就当作在传输。
-            if (dataLen < NET_EVENT_MIN_BYTES) return false;
+            // 单包 >=4KB（GRO 合并）直接算；否则要求 3 秒内至少 4 个 >=1KB 的包。
+            // QQ 这类 ~1.5KB 的推送 20-30 秒才一个，进不了速率窗口，不再重置倒计时。
+            bool active = false;
+            if (dataLen >= NET_BIG_EVENT_BYTES) {
+                active = true;
+            } else if (dataLen >= NET_EVENT_MIN_BYTES) {
+                auto& w = netRateWin[uid];
+                if (w.start == 0 || now - w.start >= NET_BURST_WINDOW_SEC) {
+                    w.start = now;
+                    w.cnt = 0;
+                }
+                if (++w.cnt >= NET_BURST_MIN_EVENTS) {
+                    w.cnt = 0;
+                    w.start = now;
+                    active = true;
+                }
+            }
+            if (!active) return false;
+
+            // 同一秒只处理一次，下载时不必每个包都走一遍倒计时/解冻判断
+            if (lastNetTrigger[uid] == now) return false;
+            lastNetTrigger[uid] = now;
 
             lastNetEvent[uid] = now;
             netEventCnt++;
@@ -1392,6 +1420,11 @@ public:
             return false;
         }
 
+        // Binder 只对“同步的 transaction”解冻：reply / oneway / free_buffer_full
+        // 不会阻塞调用方，没必要把刚冻结的 QQ 又拉起来。
+        if (strstr(msg, "bindertype=transaction") == nullptr) return isBinder;
+        if (strstr(msg, "oneway=1") != nullptr) return isBinder;
+
         auto ptr = strstr(msg, "target=");
         if (ptr == nullptr) return isBinder;
         const int targetUid = atoi(ptr + 7);
@@ -1402,6 +1435,10 @@ public:
         if (!appInfo.isSignalOrFreezer()) return isBinder;
         if (curForegroundApp.contains(targetUid)) return isBinder;
         if (pendingHandleList.contains(targetUid)) return isBinder;
+
+        const long now = static_cast<long>(time(nullptr));
+        if (now - lastBinderWake[targetUid] < BINDER_WAKE_COOLDOWN_SEC) return isBinder;
+        lastBinderWake[targetUid] = now;
 
         unFreezerTemporary(targetUid);
         freezeit.logFmt("Binder解冻 %s", appInfo.label.c_str());

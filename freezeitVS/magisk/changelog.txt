@@ -1,3 +1,9 @@
+### v3.3.4Alpha (genl)
+1. 网络触发收紧：单包 >=4KB 直接算；否则要 3 秒内 >=4 个 >=1KB 的包。QQ 那种 1.5KB/20-30秒的推送不再重置倒计时
+2. 同一 UID 每秒最多触发一次，下载时减少重复判断
+3. Binder 解冻只认同步 transaction：reply / oneway / free_buffer_full 不再解冻；同一 UID 60 秒冷却
+4. 其余同 3.3.3
+
 ### v3.3.3Alpha (genl)
 1. 修 isSignalOrFreezer() 判定方向写反：原为 freezeMode <= SIGNAL，只包含 TERMINATE/SIGNAL，把默认的 FREEZER(30)/SIGNAL_BREAK/FREEZER_BREAK 全排除了，导致订阅列表一直为空、网络事件也不生效
 2. 订阅列表为空时不再每 5 秒刷日志
