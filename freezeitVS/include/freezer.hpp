@@ -1344,6 +1344,9 @@ public:
         bool ipv6 = false;
         if (parseNetEvent(msg, uid, dataLen, ipv6)) {
             if (uid <= 0) return false;
+            // 全量广播的内核模块会把所有应用的包都发过来，这里只处理受管应用，
+            // 避免首次事件日志和计数被系统应用刷屏。
+            if (!managedApp.contains(uid) || !managedApp[uid].isSignalOrFreezer()) return false;
 
             const long now = static_cast<long>(time(nullptr));
 
