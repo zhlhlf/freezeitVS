@@ -1,2 +1,13 @@
-### v3.x 更新日志 2024-xx-xx
-1. 无
+### v3.2.1Alpha (genl)
+1. 按 Re:Kernel 网络事件文档修正：data_len=0 的握手/纯 ACK 不再算网络活动，不重置倒计时、不解冻
+2. 网络事件解析补齐 proto(ipv4/ipv6) 与 data_len 字段；Binder/网络分开计数，日志增加“零长度”
+3. 连续下载事件解冻节流（10 秒一次），避免每个 skb 都扫 /proc
+4. 订阅表回收：应用卸载/改为白名单后用 DEL_MONITOR_NET 显式取消，内核 UID 表不再只增不减
+5. 等 ACK/查版本期间收到的事件入队，不再被 recv 丢弃
+6. APP 同步 3.1.4Alpha
+
+### v3.2.0Alpha (genl)
+1. 回退用户态 /proc/net 采样（实测命中不到，且开销无收益）
+2. 保留 Re:Kernel Generic Netlink 通道（binder + 网络事件）
+3. 加强诊断：连接时打印 family/group/内核版本；订阅逐个记录结果与内核错误码
+4. APP 同步 3.1.4Alpha

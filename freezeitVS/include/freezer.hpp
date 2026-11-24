@@ -6,6 +6,7 @@
 #include "doze.hpp"
 #include "freezeit.hpp"
 #include "systemTools.hpp"
+#include "rekernelGenl.hpp"
 #include <linux/netlink.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -46,6 +47,16 @@ private:
 
     bool isReKernelConnected = false;
     int binderEventCnt = 0;
+
+    // Re:Kernel 网络事件（入站数据包）相关
+    set<int> netMonitored;              // 已向内核订阅网络事件的 UID
+    map<int, long> lastNetEvent;        // uid -> 最近一次有效入站 TCP 数据时间
+    map<int, long> lastNetLog;          // 日志节流
+    map<int, long> lastNetUnfreeze;     // 解冻节流：连续事件不重复扫 /proc
+    set<int> netSeenUid;                // 首次收到有效网络事件时打一条日志
+    uint64_t netEventCnt = 0;           // data_len>0 的事件数
+    uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
+    static constexpr int NET_IDLE_SEC = 5;  // 最近这么久内有网络包就不冻结
 
     int refreezeSecRemain = 60; //开机 一分钟时 就压一次
     int remainTimesToRefreshTopApp = 2; //允许多线程冲突，不需要原子操作
@@ -801,7 +812,9 @@ public:
         }
 
         if(isReKernelConnected)
-            freezeit.logFmt("Re:Kernel上报次数 %d", binderEventCnt);
+            freezeit.logFmt("Re:Kernel上报次数 Binder[%d] 网络[%llu] 零长度[%llu] 监听[%d]",
+                binderEventCnt, (unsigned long long)netEventCnt,
+                (unsigned long long)netIgnoredZero, (int)netMonitored.size());
 
         stackString<64> tips;
         int tmp = systemTools.runningTime;
@@ -878,6 +891,20 @@ public:
 
             const int uid = it->first;
             auto& appInfo = managedApp[uid];
+
+            // 最近有入站网络包（下载/推送），不冻结，重新计时
+            auto netIt = lastNetEvent.find(uid);
+            if (netIt != lastNetEvent.end() && !appInfo.isWhitelist()) {
+                const long now = static_cast<long>(time(nullptr));
+                if (now - netIt->second < NET_IDLE_SEC) {
+                    const int holdSec = settings.freezeTimeout;
+                    remainSec = holdSec;
+                    freezeit.logFmt("🌐网络活动, 暂不冻结 %s, 重置 %ds",
+                        appInfo.label.c_str(), holdSec);
+                    it++;
+                    continue;
+                }
+            }
 
             if (appInfo.isWhitelist()) { // 刚切换成白名单的
                 it = pendingHandleList.erase(it);
@@ -1180,8 +1207,202 @@ public:
         freezeit.log("已退出监控同步事件: 0xB0");
     }
 
-    // Binder事件 需要额外magisk模块: ReKernel
+    // 确认某个 UID 正在收数据：重置倒计时 / 需要时解冻
+    void applyNetActivity(int uid) {
+        const long now = static_cast<long>(time(nullptr));
+
+        if (!managedApp.contains(uid)) return;
+        auto& appInfo = managedApp[uid];
+        if (!appInfo.isSignalOrFreezer()) return;
+
+        // 重置到应用设置里的“超时冻结”秒数，而不是写死的值
+        const int holdSec = settings.freezeTimeout;
+
+        auto it = pendingHandleList.find(uid);
+        if (it != pendingHandleList.end()) {
+            if (it->second < holdSec) {
+                it->second = holdSec;
+                if (now - lastNetLog[uid] > 30) {
+                    lastNetLog[uid] = now;
+                    freezeit.logFmt("🌐网络活动, %s 冻结倒计时重置 %ds",
+                        appInfo.label.c_str(), holdSec);
+                }
+            }
+            return;
+        }
+
+        if (curForegroundApp.contains(uid)) return;
+
+        // 一次下载会连发大量事件：解冻本身要扫 /proc，这里 10 秒内只做一次。
+        // 之后该 UID 已在 curForegroundApp 里，重复事件会在上面直接返回。
+        if (now - lastNetUnfreeze[uid] < 10) return;
+        lastNetUnfreeze[uid] = now;
+
+        unFreezerTemporary(uid);
+        if (now - lastNetLog[uid] > 30) {
+            lastNetLog[uid] = now;
+            freezeit.logFmt("🌐网络解冻 %s", appInfo.label.c_str());
+        }
+    }
+
+    // 把受管应用（冻结/信号模式）注册到内核的网络监听表；不再需要的显式 DEL，
+    // 因为内核的 UID 监控表是全局的，进程退出也不会自动清。
+    void syncNetMonitor(rekernelGenl::Client& genl) {
+        int removed = 0, added = 0, failed = 0, total = 0, lastSubError = 0;
+
+        for (auto it = netMonitored.begin(); it != netMonitored.end();) {
+            const int uid = *it;
+            const bool keep = managedApp.contains(uid) && managedApp[uid].isSignalOrFreezer();
+            if (keep) {
+                ++it;
+                continue;
+            }
+            int err = 0;
+            if (genl.delMonitorNet(static_cast<uint32_t>(uid), &err)) {
+                removed++;
+            }
+            // 应用已卸载/改成白名单：无论 DEL 是否成功都不再计入
+            it = netMonitored.erase(it);
+        }
+
+        for (int uid = ManagedApp::UID_START; uid < ManagedApp::UID_END; ++uid) {
+            if (!managedApp.contains(uid)) continue;
+            if (!managedApp[uid].isSignalOrFreezer()) continue;
+
+            total++;
+            if (netMonitored.contains(uid)) continue;
+
+            int err = 0;
+            if (genl.addMonitorNet(static_cast<uint32_t>(uid), &err)) {
+                netMonitored.insert(uid);
+                added++;
+            }
+            else {
+                failed++;
+                lastSubError = err;
+                if (failed <= 3)
+                    freezeit.logFmt("🌐网络监听订阅失败 uid=%d 内核错误=%d",
+                        uid, err);
+            }
+        }
+        if (total == 0)
+            freezeit.log("Re:Kernel 网络监听: 没有可订阅的应用(需冻结/信号模式)");
+        else
+            freezeit.logFmt("Re:Kernel 网络监听 %d/%d 应用 (新增%d 取消%d 失败%d 错误码%d)",
+                (int)netMonitored.size(), total, added, removed, failed, lastSubError);
+    }
+
+    // 解析 "type=Network,target=<uid>,proto=ipv4|ipv6,data_len=<n>;"
+    // data_len 是单个 skb 的 TCP payload（GRO 合并后可能是 1404 的整数倍），
+    // 握手/纯 ACK 也会上报，此时为 0，不能算“正在下载”。
+    static bool parseNetEvent(const char* msg, int& uid, int& dataLen, bool& ipv6) {
+        if (strncmp(msg, "type=Network", 12) != 0) return false;
+        const char* p = strstr(msg, "target=");
+        if (p == nullptr) return false;
+
+        uid = atoi(p + 7);
+        dataLen = -1; // 旧版协议可能没有该字段，按“有活动”处理
+        ipv6 = false;
+
+        p = strstr(msg, "data_len=");
+        if (p != nullptr) dataLen = atoi(p + 9);
+        p = strstr(msg, "proto=");
+        if (p != nullptr && strncmp(p + 6, "ipv6", 4) == 0) ipv6 = true;
+        return true;
+    }
+
+    // Re:Kernel 事件处理，genl 与旧 netlink 共用
+    // 返回 true 表示这是 Binder 事件（用于计数）
+    bool handleReKernelEvent(const char* msg) {
+        const bool isBinder = strncmp(msg, "type=Binder", 11) == 0;
+
+        int uid = 0, dataLen = -1;
+        bool ipv6 = false;
+        if (parseNetEvent(msg, uid, dataLen, ipv6)) {
+            if (uid <= 0) return false;
+
+            // 只统计入方向 TCP 的真实数据；data_len=0 是握手/纯 ACK，不算活动
+            if (dataLen == 0) {
+                netIgnoredZero++;
+                return false;
+            }
+
+            lastNetEvent[uid] = static_cast<long>(time(nullptr));
+            netEventCnt++;
+            if (netSeenUid.insert(uid).second) {
+                freezeit.logFmt("🌐网络事件已生效 %s uid=%d proto=%s data_len=%d",
+                    managedApp.contains(uid) ? managedApp[uid].label.c_str() : "?",
+                    uid, ipv6 ? "ipv6" : "ipv4", dataLen);
+            }
+            applyNetActivity(uid);
+            return false;
+        }
+
+        auto ptr = strstr(msg, "target=");
+        if (ptr == nullptr) return isBinder;
+        const int targetUid = atoi(ptr + 7);
+
+        if (!managedApp.contains(targetUid)) return isBinder;
+
+        auto& appInfo = managedApp[targetUid];
+        if (!appInfo.isSignalOrFreezer()) return isBinder;
+        if (curForegroundApp.contains(targetUid)) return isBinder;
+        if (pendingHandleList.contains(targetUid)) return isBinder;
+
+        unFreezerTemporary(targetUid);
+        freezeit.logFmt("Binder解冻 %s", appInfo.label.c_str());
+        return isBinder;
+    }
+
+    // 新版 Re:Kernel(11+) 默认 Generic Netlink，不再创建 /proc/rekernel
     void binderEventTriggerTask() {
+        while (true) {
+            rekernelGenl::Client genl;
+            if (!genl.open()) break; // 非 genl 版本或未安装，转旧协议
+
+            char ver[64] = {};
+            if (genl.queryVersion(ver, sizeof(ver)))
+                freezeit.logFmt("Re:Kernel(genl) 已连接 family=%u group=%u 内核版本=%s",
+                    genl.familyId, genl.groupId, ver);
+            else
+                freezeit.logFmt("Re:Kernel(genl) 已连接 family=%u group=%u (版本查询无响应)",
+                    genl.familyId, genl.groupId);
+            isReKernelConnected = true;
+
+            netMonitored.clear();
+            syncNetMonitor(genl);
+
+            long lastSync = static_cast<long>(time(nullptr));
+            while (true) {
+                char msg[256];
+                const int n = genl.recvEvent(msg, sizeof(msg));
+                if (n < 0) {
+                    freezeit.log("Re:Kernel(genl) 接收中断，稍后重连");
+                    break;
+                }
+                if (n == 0) { // 超时，顺便同步新装/改配置的应用
+                    const long now = static_cast<long>(time(nullptr));
+                    if (now - lastSync >= 60) {
+                        lastSync = now;
+                        syncNetMonitor(genl);
+                    }
+                    continue;
+                }
+                if (handleReKernelEvent(msg))
+                    binderEventCnt++;
+            }
+
+            genl.close();
+            isReKernelConnected = false;
+            sleep(60);
+        }
+
+        freezeit.log("Re:Kernel: 未发现 genl 接口，尝试旧版 /proc/rekernel");
+        legacyBinderEventTask();
+    }
+
+    // 旧版 Re:Kernel：/proc/rekernel/<端口> + raw netlink
+    void legacyBinderEventTask() {
         int skfd;
         int ret;
         user_msg_info u_info{};
@@ -1273,18 +1494,8 @@ public:
                     break;
                 }
 
-                auto ptr = strstr(u_info.msg, "target=");
-                if (ptr != nullptr) {
-                    const int uid = atoi(ptr + 7);
-                    if (managedApp.contains(uid) && managedApp[uid].isSignalOrFreezer()
-                        && (!curForegroundApp.contains(uid))
-                        && (!pendingHandleList.contains(uid))) {
-                        unFreezerTemporary(uid);
-                        freezeit.logFmt("Binder解冻 %s", managedApp[uid].label.c_str());
-                    }
-                }
-
-                binderEventCnt++;
+                if (handleReKernelEvent(u_info.msg))
+                    binderEventCnt++;
             }
 
             close(skfd);
