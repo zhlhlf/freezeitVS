@@ -56,7 +56,8 @@ private:
     struct ZeroWin { long start = 0; int cnt = 0; };
     map<int, ZeroWin> netZeroWin;       // uid -> 零长度入向包窗口（疑似上传时的对端 ACK）
     struct RateWin { long start = 0; int cnt = 0; };
-    map<int, RateWin> netRateWin;       // uid -> 1KB 以上包的短窗口计数
+    map<int, RateWin> netRateWin;       // uid -> TCP 大包短窗口计数
+    map<int, RateWin> netRateWinUdp;    // uid -> UDP 包短窗口计数（阈值更低）
     map<int, long> lastNetTrigger;      // uid -> 上次触发（同一秒只处理一次）
     map<int, long> lastBinderWake;      // uid -> 上次 Binder 解冻，做冷却
     set<int> netSeenUid;                // 首次命中有效事件时打一条日志
@@ -73,9 +74,14 @@ private:
 
     // data_len 是单个 skb 的瞬时值，不做时间累积。正常下载的报文基本都是
     // 1404/1440 的整 MSS（GRO 后是 2808、4212 的倍数），推送给付通常几百字节。
-    static constexpr int NET_EVENT_MIN_BYTES = 1024; // 参与速率统计的最小包
-    static constexpr int NET_BIG_EVENT_BYTES = 4096; // 单包 >=4KB（GRO 合并）直接算
-    static constexpr int NET_BURST_WINDOW_SEC = 3;   // 或 3 秒内 >=4 个 >=1KB 的包
+    // TCP：保持原策略。QQ 这类 ~1.5KB 的推送 20-30 秒才一个，
+    // 进不了速率窗口，不会重置倒计时。
+    static constexpr int NET_EVENT_MIN_BYTES = 1024; // TCP 参与速率统计的最小包
+    static constexpr int NET_BIG_EVENT_BYTES = 4096; // TCP 单包 >=4KB（GRO 合并）直接算
+    // UDP：视频/语音是私有 RTC 协议，单包普遍 600~1200B，阈值单独调低。
+    static constexpr int NET_UDP_MIN_BYTES = 512;    // UDP 参与速率统计的最小包
+    static constexpr int NET_UDP_BIG_EVENT_BYTES = 2048; // UDP 单包 >=2KB 直接算
+    static constexpr int NET_BURST_WINDOW_SEC = 3;   // 或 3 秒内 >=4 个达标包
     static constexpr int NET_BURST_MIN_EVENTS = 4;
     static constexpr int BINDER_WAKE_COOLDOWN_SEC = 60; // 同一 UID 的 Binder 解冻冷却
     // Re:Kernel 只上报入方向（LOCAL_IN）。出方向没有字节数可用，只能间接看：
@@ -1405,13 +1411,16 @@ public:
                 return false;
             }
 
-            // 单包 >=4KB（GRO 合并）直接算；否则要求 3 秒内至少 4 个 >=1KB 的包。
-            // QQ 这类 ~1.5KB 的推送 20-30 秒才一个，进不了速率窗口，不再重置倒计时。
+            // TCP：单包 >=4KB（GRO 合并）直接算；否则要 3 秒内至少 4 个 >=1KB 的包。
+            // UDP：阈值更低（>=2KB 直接算，否则 3 秒内 4 个 >=512B），因为视频
+            // 通话的 RTC 包本身就在 600B~1.2KB 区间。
+            const int minBytes = udp ? NET_UDP_MIN_BYTES : NET_EVENT_MIN_BYTES;
+            const int bigBytes = udp ? NET_UDP_BIG_EVENT_BYTES : NET_BIG_EVENT_BYTES;
             bool active = false;
-            if (dataLen >= NET_BIG_EVENT_BYTES) {
+            if (dataLen >= bigBytes) {
                 active = true;
-            } else if (dataLen >= NET_EVENT_MIN_BYTES) {
-                auto& w = netRateWin[uid];
+            } else if (dataLen >= minBytes) {
+                auto& w = udp ? netRateWinUdp[uid] : netRateWin[uid];
                 if (w.start == 0 || now - w.start >= NET_BURST_WINDOW_SEC) {
                     w.start = now;
                     w.cnt = 0;
