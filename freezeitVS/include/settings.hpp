@@ -33,8 +33,8 @@ private:
             0,  //[18] 
             1,  //[19]
             0,  //[20]
-            0,  //[21]
-            0,  //[22]
+            0,  //[21] Re:Kernel TCP 报文阈值索引
+            0,  //[22] Re:Kernel UDP 报文阈值索引
             0,  //[13]
             0,  //[24]
             0,  //[25]
@@ -52,6 +52,14 @@ private:
     static constexpr int refreezeTimeoutList[] = { 86400 * 365, 60 * 30, 3600, 3600 * 2 };
     // 最大索引
     static constexpr int refreezeTimeoutIdxMax = sizeof(refreezeTimeoutList) / sizeof(refreezeTimeoutList[0]) - 1;
+
+    // Re:Kernel 网络事件阈值。索引 0 表示用内核模块默认值（TCP 1024 / UDP 512）。
+    static constexpr int netMinPayloadTcpList[] = { 0, 512, 1024, 2048, 4096, 8192 };
+    static constexpr int netMinPayloadTcpIdxMax =
+        sizeof(netMinPayloadTcpList) / sizeof(netMinPayloadTcpList[0]) - 1;
+    static constexpr int netMinPayloadUdpList[] = { 0, 256, 512, 1024, 2048, 4096 };
+    static constexpr int netMinPayloadUdpIdxMax =
+        sizeof(netMinPayloadUdpList) / sizeof(netMinPayloadUdpList[0]) - 1;
 
     // 关闭, 5m, 15m, 30m, 1h, 2h
     static constexpr int wakeupTimeoutList[] = { 86400 * 365, 60 * 5, 60 * 15, 60 * 30, 3600, 3600 * 2 };
@@ -74,6 +82,9 @@ public:
     uint8_t& enableLMK = settingsVar[16];              // 调整 lmk 参数 仅安卓11-15
     uint8_t& enableDoze = settingsVar[17];             // 深度Doze
     //uint8_t& unknown = settingsVar[18];                // 
+
+    uint8_t& netMinPayloadTcpIdx = settingsVar[21]; // Re:Kernel TCP 报文阈值索引
+    uint8_t& netMinPayloadUdpIdx = settingsVar[22]; // Re:Kernel UDP 报文阈值索引
 
     uint8_t& enableDebug = settingsVar[30];        // 调试日志
 
@@ -158,6 +169,13 @@ public:
         return SETTINGS_SIZE;
     }
 
+    int getNetMinPayloadTcp() const {
+        return netMinPayloadTcpList[netMinPayloadTcpIdx <= netMinPayloadTcpIdxMax ? netMinPayloadTcpIdx : 0];
+    }
+    int getNetMinPayloadUdp() const {
+        return netMinPayloadUdpList[netMinPayloadUdpIdx <= netMinPayloadUdpIdxMax ? netMinPayloadUdpIdx : 0];
+    }
+
     bool isRefreezeEnable() const {
         return 0 < refreezeTimeoutIdx && refreezeTimeoutIdx <= refreezeTimeoutIdxMax;
     }
@@ -230,9 +248,19 @@ public:
         case 17: // doze
         case 18: // xxx
         case 19: //
+        case 21: { // Re:Kernel TCP 阈值索引
+            if (val > netMinPayloadTcpIdxMax)
+                return snprintf(replyBuf, REPLY_BUF_SIZE, "TCP报文阈值参数错误, 欲设为:%d", val);
+        }
+        break;
+
+        case 22: { // Re:Kernel UDP 阈值索引
+            if (val > netMinPayloadUdpIdxMax)
+                return snprintf(replyBuf, REPLY_BUF_SIZE, "UDP报文阈值参数错误, 欲设为:%d", val);
+        }
+        break;
+
         case 20: //
-        case 21: //
-        case 22: //
         case 23: //
         case 24: //
         case 25: //

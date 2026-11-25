@@ -64,6 +64,8 @@ private:
     set<int> netOutSeen;                // 首次命中“疑似上传”时打一条日志
     set<int> netZeroSeen;               // 首次收到零长度事件时打一条日志（判断通道是否通）
     long lastNetSummary = 0;            // 订阅摘要日志节流
+    uint32_t netAppliedTcp = 0;         // 已下发到内核的 TCP 阈值（0=内核默认）
+    uint32_t netAppliedUdp = 0;         // 已下发到内核的 UDP 阈值（0=内核默认）
     static constexpr int NET_SYNC_SEC = 5;   // 每 5 秒核对一次订阅（应用可能刚启动/刚改配置）
     uint64_t netEventCnt = 0;           // 命中有效活动（入向大数据/疑似上传）的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
@@ -1282,6 +1284,23 @@ public:
     void syncNetMonitor(rekernelGenl::Client& genl) {
         int removed = 0, added = 0, failed = 0, total = 0, lastSubError = 0;
 
+        // 设置页的 Re:Kernel 阈值：变了就重发一遍订阅（内核侧 ADD 即更新语义）
+        const uint32_t wantTcp = static_cast<uint32_t>(settings.getNetMinPayloadTcp());
+        const uint32_t wantUdp = static_cast<uint32_t>(settings.getNetMinPayloadUdp());
+        const bool thresholdChanged = wantTcp != netAppliedTcp || wantUdp != netAppliedUdp;
+        if (thresholdChanged) {
+            for (const int uid : netMonitored) {
+                int err = 0;
+                genl.addMonitorNet(static_cast<uint32_t>(uid), wantTcp, wantUdp, &err);
+            }
+            netAppliedTcp = wantTcp;
+            netAppliedUdp = wantUdp;
+            if (!netMonitored.empty()) {
+                freezeit.logFmt("Re:Kernel 阈值已更新 TCP≥%uB UDP≥%uB（0=内核默认），重订阅 %d 个应用",
+                    wantTcp, wantUdp, (int)netMonitored.size());
+            }
+        }
+
         for (auto it = netMonitored.begin(); it != netMonitored.end();) {
             const int uid = *it;
             const bool keep = managedApp.contains(uid) && managedApp[uid].isSignalOrFreezer();
@@ -1305,7 +1324,7 @@ public:
             if (netMonitored.contains(uid)) continue;
 
             int err = 0;
-            if (genl.addMonitorNet(static_cast<uint32_t>(uid), &err)) {
+            if (genl.addMonitorNet(static_cast<uint32_t>(uid), wantTcp, wantUdp, &err)) {
                 netMonitored.insert(uid);
                 added++;
                 if (added <= 5)

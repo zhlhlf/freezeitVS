@@ -61,3 +61,9 @@
 2. 保留 Re:Kernel Generic Netlink 通道（binder + 网络事件）
 3. 加强诊断：连接时打印 family/group/内核版本；订阅逐个记录结果与内核错误码
 4. APP 同步 3.1.4Alpha
+
+### v3.3.8Alpha (genl)
+1. 新增 Re:Kernel 网络事件阈值设置（APP 设置页）
+2. TCP/UDP 阈值随订阅下发到内核（Generic Netlink 属性），不再需要 echo 写 sysfs 节点
+3. 阈值变化后自动重订阅全部受管应用；默认值仍由内核模块参数决定
+4. 需内核模块 11.9-sub 及以上（旧版内核会忽略新增属性，回落到模块默认值）

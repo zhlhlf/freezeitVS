@@ -25,6 +25,8 @@ static constexpr int CMD_ADD_MONITOR_NET = 2; // REKERNEL_C_ADD_MONITOR_NET
 static constexpr int CMD_DEL_MONITOR_NET = 3; // REKERNEL_C_DEL_MONITOR_NET
 static constexpr int ATTR_MSG = 1;            // REKERNEL_A_MSG
 static constexpr int ATTR_UID = 2;            // REKERNEL_A_UID
+static constexpr int ATTR_MIN_PAYLOAD = 5;     // REKERNEL_A_MIN_PAYLOAD（0=内核默认）
+static constexpr int ATTR_MIN_PAYLOAD_UDP = 6; // REKERNEL_A_MIN_PAYLOAD_UDP（0=内核默认）
 static constexpr int CMD_GET_VERSION = 4;     // REKERNEL_C_GET_VERSION
 
 inline int nlaAlign(int len) { return (len + 3) & ~3; }
@@ -121,9 +123,11 @@ public:
         return true;
     }
 
-    // 订阅/取消某个 UID 的入站网络包事件，返回内核错误码（0 成功）
-    bool addMonitorNet(uint32_t uid, int* kernelError = nullptr) {
-        return sendUidCommand(CMD_ADD_MONITOR_NET, uid, kernelError);
+    // 订阅某个 UID 的网络包事件，同时携带该 UID 的 TCP/UDP 报文阈值（0 = 用内核默认）。
+    // 重复订阅即更新阈值，所以改设置后重发一遍 ADD 即可。
+    bool addMonitorNet(uint32_t uid, uint32_t minPayload, uint32_t minPayloadUdp,
+                       int* kernelError = nullptr) {
+        return sendUidCommand(CMD_ADD_MONITOR_NET, uid, kernelError, minPayload, minPayloadUdp);
     }
 
     bool delMonitorNet(uint32_t uid, int* kernelError = nullptr) {
@@ -271,7 +275,8 @@ private:
         return false;
     }
 
-    bool sendUidCommand(int cmd, uint32_t uid, int* kernelError) {
+    bool sendUidCommand(int cmd, uint32_t uid, int* kernelError,
+                        uint32_t minPayload = 0, uint32_t minPayloadUdp = 0) {
         if (fd < 0 || familyId == 0) return false;
         if (kernelError != nullptr) *kernelError = 0;
 
@@ -293,6 +298,19 @@ private:
         a->nla_len = static_cast<uint16_t>(sizeof(struct nlattr) + sizeof(uint32_t));
         ::memcpy(reinterpret_cast<char*>(a) + sizeof(struct nlattr), &uid, sizeof(uint32_t));
         nlh->nlmsg_len += NLA_ALIGN(a->nla_len);
+
+        // 可选的阈值属性：0 表示交给内核默认值，也就不用发
+        auto putU32 = [&](uint16_t type, uint32_t value) {
+            auto* u = reinterpret_cast<struct nlattr*>(req + nlh->nlmsg_len);
+            u->nla_type = type;
+            u->nla_len = static_cast<uint16_t>(sizeof(struct nlattr) + sizeof(uint32_t));
+            ::memcpy(reinterpret_cast<char*>(u) + sizeof(struct nlattr), &value, sizeof(uint32_t));
+            nlh->nlmsg_len += NLA_ALIGN(u->nla_len);
+        };
+        if (cmd == CMD_ADD_MONITOR_NET) {
+            if (minPayload != 0) putU32(ATTR_MIN_PAYLOAD, minPayload);
+            if (minPayloadUdp != 0) putU32(ATTR_MIN_PAYLOAD_UDP, minPayloadUdp);
+        }
 
         struct sockaddr_nl kernel{};
         kernel.nl_family = AF_NETLINK;
