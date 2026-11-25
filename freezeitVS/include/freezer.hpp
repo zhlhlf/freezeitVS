@@ -1375,6 +1375,13 @@ public:
             auto bp = strstr(msg, "bytes=");
             const unsigned long long bytes = bp ? strtoull(bp + 6, nullptr, 10) : 0;
             if (statUid <= 0 || bytes == 0) return false;
+
+            // 调试开关打开时把每条聚合都打出来（含非受管 UID），用来确认某个应用的
+            // 流量到底有没有进内核统计、归属到哪个 UID
+            if (freezeit.isDebugOn() && bytes >= 1024ULL) {
+                freezeit.logFmt("🌐NetStat uid=%d %lluKB %s", statUid, bytes / 1024ULL,
+                    managedApp.contains(statUid) ? managedApp[statUid].label.c_str() : "非受管");
+            }
             if (!managedApp.contains(statUid) || !managedApp[statUid].isSignalOrFreezer()) return false;
 
             netStatMsgCnt++;
