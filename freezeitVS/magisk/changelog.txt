@@ -81,3 +81,8 @@
 ### v3.3.11Alpha (genl)
 1. 内核不支持阈值属性（旧版返回 -22）时自动回退为只订阅 UID，并提示升级 11.9-sub
 2. APP 滑块改用 Material Slider（Material 3 样式），去掉 0/20000 刻度说明
+
+### v3.3.12Alpha (genl)
+1. 网络统计改由内核每秒聚合上报（type=NetStat），不再依赖逐包事件
+2. 阈值改为“1 秒流量 > N KB 才算活跃”，默认 5KB，范围 0-1000KB，0=任意流量
+3. 阈值下发命令沿用 setSettingsVar16，字段类型 0 表示 KB 阈值

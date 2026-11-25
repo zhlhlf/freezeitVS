@@ -64,9 +64,8 @@ private:
     set<int> netOutSeen;                // 首次命中“疑似上传”时打一条日志
     set<int> netZeroSeen;               // 首次收到零长度事件时打一条日志（判断通道是否通）
     long lastNetSummary = 0;            // 订阅摘要日志节流
-    uint32_t netAppliedTcp = 0;         // 已下发到内核的 TCP 阈值（0=内核默认）
-    uint32_t netAppliedUdp = 0;         // 已下发到内核的 UDP 阈值（0=内核默认）
-    bool netThresholdUnsupported = false; // 旧内核不认识阈值属性（-EINVAL），已回退
+    uint64_t netStatMsgCnt = 0;         // 收到的 1 秒聚合上报条数
+    uint64_t netStatHitCnt = 0;         // 其中超过阈值、算作活跃的次数
     static constexpr int NET_SYNC_SEC = 5;   // 每 5 秒核对一次订阅（应用可能刚启动/刚改配置）
     uint64_t netEventCnt = 0;           // 命中有效活动（入向大数据/疑似上传）的次数
     uint64_t netIgnoredZero = 0;        // data_len=0（握手/纯 ACK）事件数
@@ -847,8 +846,9 @@ public:
         }
 
         if(isReKernelConnected)
-            freezeit.logFmt("Re:Kernel上报次数 Binder[%d] 触发[%llu] TCP事件[%llu] UDP事件[%llu] 零长度[%llu] 监听[%d]",
+            freezeit.logFmt("Re:Kernel上报次数 Binder[%d] 触发[%llu] 1秒聚合[%llu] 超阈值[%llu] TCP事件[%llu] UDP事件[%llu] 零长度[%llu] 监听[%d]",
                 binderEventCnt, (unsigned long long)netEventCnt,
+                (unsigned long long)netStatMsgCnt, (unsigned long long)netStatHitCnt,
                 (unsigned long long)netTcpSeen, (unsigned long long)netUdpSeen,
                 (unsigned long long)netIgnoredZero, (int)netMonitored.size());
 
@@ -1285,31 +1285,6 @@ public:
     void syncNetMonitor(rekernelGenl::Client& genl) {
         int removed = 0, added = 0, failed = 0, total = 0, lastSubError = 0;
 
-        // 设置页的 Re:Kernel 阈值：变了就重发一遍订阅（内核侧 ADD 即更新语义）
-        const uint32_t wantTcp = static_cast<uint32_t>(settings.getNetMinPayloadTcp());
-        const uint32_t wantUdp = static_cast<uint32_t>(settings.getNetMinPayloadUdp());
-        const bool thresholdChanged = wantTcp != netAppliedTcp || wantUdp != netAppliedUdp;
-        if (thresholdChanged) {
-            const uint32_t sendTcp = netThresholdUnsupported ? 0 : wantTcp;
-            const uint32_t sendUdp = netThresholdUnsupported ? 0 : wantUdp;
-            for (const int uid : netMonitored) {
-                int err = 0;
-                if (!genl.addMonitorNet(static_cast<uint32_t>(uid), sendTcp, sendUdp, &err) &&
-                    err == -22 && (sendTcp || sendUdp)) {
-                    // 旧版内核严格校验不认识新属性，回退成只带 UID
-                    netThresholdUnsupported = true;
-                    genl.addMonitorNet(static_cast<uint32_t>(uid), 0, 0, nullptr);
-                    freezeit.log("内核不支持订阅携带阈值(旧版)，已回退模块默认值；升级 Re:Kernel 到 11.9-sub 后阈值设置才会生效");
-                }
-            }
-            netAppliedTcp = wantTcp;
-            netAppliedUdp = wantUdp;
-            if (!netMonitored.empty()) {
-                freezeit.logFmt("Re:Kernel 阈值已更新 TCP≥%uB UDP≥%uB（0=内核默认），重订阅 %d 个应用",
-                    wantTcp, wantUdp, (int)netMonitored.size());
-            }
-        }
-
         for (auto it = netMonitored.begin(); it != netMonitored.end();) {
             const int uid = *it;
             const bool keep = managedApp.contains(uid) && managedApp[uid].isSignalOrFreezer();
@@ -1332,29 +1307,14 @@ public:
             total++;
             if (netMonitored.contains(uid)) continue;
 
+            // 阈值属性传 0 用模块默认：内核默认只发 1 秒聚合（NetStat），不发逐包事件
             int err = 0;
-            if (genl.addMonitorNet(static_cast<uint32_t>(uid),
-                    netThresholdUnsupported ? 0 : wantTcp,
-                    netThresholdUnsupported ? 0 : wantUdp, &err)) {
+            if (genl.addMonitorNet(static_cast<uint32_t>(uid), 0, 0, &err)) {
                 netMonitored.insert(uid);
                 added++;
                 if (added <= 5)
                     freezeit.logFmt("🌐监听已加 %s uid=%d",
                         managedApp[uid].label.c_str(), uid);
-            }
-            else if (err == -22 && (wantTcp || wantUdp) && !netThresholdUnsupported) {
-                // 旧内核 strict 校验不认识的属性，回退成只带 UID 再试一次
-                int err2 = 0;
-                netThresholdUnsupported = true;
-                freezeit.log("内核不支持订阅携带阈值(旧版)，已回退模块默认值；升级 Re:Kernel 到 11.9-sub 后阈值设置才会生效");
-                if (genl.addMonitorNet(static_cast<uint32_t>(uid), 0, 0, &err2)) {
-                    netMonitored.insert(uid);
-                    added++;
-                }
-                else {
-                    failed++;
-                    lastSubError = err2;
-                }
             }
             else {
                 failed++;
@@ -1406,6 +1366,38 @@ public:
     // 返回 true 表示这是 Binder 事件（用于计数）
     bool handleReKernelEvent(const char* msg) {
         const bool isBinder = strncmp(msg, "type=Binder", 11) == 0;
+
+        // 内核每秒聚合上报：type=NetStat,target=<uid>,bytes=<本秒总字节>;
+        if (strncmp(msg, "type=NetStat", 12) == 0) {
+            auto tp = strstr(msg, "target=");
+            if (tp == nullptr) return false;
+            const int statUid = atoi(tp + 7);
+            auto bp = strstr(msg, "bytes=");
+            const unsigned long long bytes = bp ? strtoull(bp + 6, nullptr, 10) : 0;
+            if (statUid <= 0 || bytes == 0) return false;
+            if (!managedApp.contains(statUid) || !managedApp[statUid].isSignalOrFreezer()) return false;
+
+            netStatMsgCnt++;
+            const unsigned long long limitKb = settings.getNetStatThresholdKb();
+            if (bytes <= limitKb * 1024ULL) return false; // 未达阈值，不算活跃
+
+            netStatHitCnt++;
+            // 超过阈值：算一次网络活跃并重置本 uid 的速率窗口（内核侧已按秒清零）
+            netRateWin.erase(statUid);
+            netRateWinUdp.erase(statUid);
+            netZeroWin.erase(statUid);
+            const long statNow = static_cast<long>(time(nullptr));
+            lastNetEvent[statUid] = statNow;
+            netEventCnt++;
+            if (statNow - lastNetLog[statUid] > 30) {
+                lastNetLog[statUid] = statNow;
+                freezeit.logFmt("🌐网络活跃 %s uid=%d 1秒 %lluKB > 阈值%lluKB",
+                    managedApp[statUid].label.c_str(), statUid,
+                    bytes / 1024ULL, limitKb);
+            }
+            applyNetActivity(statUid);
+            return false;
+        }
 
         int uid = 0, dataLen = -1;
         bool ipv6 = false, udp = false, outbound = false;

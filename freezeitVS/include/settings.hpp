@@ -56,11 +56,12 @@ private:
     // 最大索引
     static constexpr int refreezeTimeoutIdxMax = sizeof(refreezeTimeoutList) / sizeof(refreezeTimeoutList[0]) - 1;
 
-    // Re:Kernel 网络事件阈值（单位字节，0 表示用内核模块默认值 TCP 1024 / UDP 512）。
-    // 存成 u16 小端，占用 [21..22] 与 [23..24]。
-    static constexpr int NET_MIN_PAYLOAD_MAX = 20000;
-    static constexpr int NET_TCP_OFFSET = 21;
-    static constexpr int NET_UDP_OFFSET = 23;
+    // Re:Kernel 网络活跃阈值：内核每秒把各 uid 的入向流量聚合上报一次，
+    // 1 秒总量超过该 KB 数就算“正在用网”。u16 小端占用 [21..22]，单位 KB，
+    // 0 表示任意流量都算（等价于 1 字节）。[25]=2 表示已按新口径初始化。
+    static constexpr int NET_STAT_KB_MAX = 1000;
+    static constexpr int NET_STAT_KB_DEFAULT = 5;
+    static constexpr int NET_STAT_OFFSET = 21;
 
     static uint16_t readU16(const uint8_t* p) {
         return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
@@ -121,14 +122,13 @@ public:
             else {
                 memcpy(settingsVar, tmp, SETTINGS_SIZE);
 
-                // 老版本没有 Re:Kernel 阈值字段（全 0），补成默认 TCP 1024 / UDP 512。
+                // 老版本没有 Re:Kernel 1 秒流量阈值字段，补成默认 5 KB。
                 // 用 [25] 做一次性标记，之后用户主动设成 0 不会被改回去。
-                if (settingsVar[25] != 1) {
-                    writeU16(settingsVar + NET_TCP_OFFSET, 1024);
-                    writeU16(settingsVar + NET_UDP_OFFSET, 512);
-                    settingsVar[25] = 1;
+                if (settingsVar[25] != 2) {
+                    writeU16(settingsVar + NET_STAT_OFFSET, NET_STAT_KB_DEFAULT);
+                    settingsVar[25] = 2;
                     settingsVar[0] = settingsVer;
-                    freezeit.log("已为旧设置补上 Re:Kernel 阈值默认值 TCP 1024B / UDP 512B");
+                    freezeit.log("已为旧设置补上 Re:Kernel 1 秒流量阈值默认值 5KB");
                     freezeit.log(save() ? "⚙️设置成功" : "🔧设置文件写入失败");
                 }
 
@@ -186,25 +186,20 @@ public:
         return SETTINGS_SIZE;
     }
 
-    uint16_t getNetMinPayloadTcp() const { return readU16(settingsVar + NET_TCP_OFFSET); }
-    uint16_t getNetMinPayloadUdp() const { return readU16(settingsVar + NET_UDP_OFFSET); }
+    // 1 秒流量阈值，单位 KB。0 表示任意流量都算活跃。
+    uint16_t getNetStatThresholdKb() const { return readU16(settingsVar + NET_STAT_OFFSET); }
 
-    // which: 0=TCP, 1=UDP。value 单位字节，0 表示用内核默认值。
-    int setNetMinPayload(int which, int value, char* replyBuf) {
+    int setNetStatThresholdKb(int value, char* replyBuf) {
         const size_t REPLY_BUF_SIZE = 2048;
-        if (value < 0 || value > NET_MIN_PAYLOAD_MAX)
-            return snprintf(replyBuf, REPLY_BUF_SIZE, "报文阈值超出范围 0-%d, 欲设为:%d",
-                NET_MIN_PAYLOAD_MAX, value);
-        if (which != 0 && which != 1)
-            return snprintf(replyBuf, REPLY_BUF_SIZE, "报文阈值类型错误:%d", which);
+        if (value < 0 || value > NET_STAT_KB_MAX)
+            return snprintf(replyBuf, REPLY_BUF_SIZE, "流量阈值超出范围 0-%d, 欲设为:%d",
+                NET_STAT_KB_MAX, value);
 
-        writeU16(settingsVar + (which == 0 ? NET_TCP_OFFSET : NET_UDP_OFFSET),
-                 static_cast<uint16_t>(value));
-        settingsVar[25] = 1; // 已初始化标记
+        writeU16(settingsVar + NET_STAT_OFFSET, static_cast<uint16_t>(value));
+        settingsVar[25] = 2; // 已初始化标记
         if (save())
             return snprintf(replyBuf, REPLY_BUF_SIZE, "success");
-        return snprintf(replyBuf, REPLY_BUF_SIZE, "写入设置文件失败, %s阈值:%d",
-            which == 0 ? "TCP" : "UDP", value);
+        return snprintf(replyBuf, REPLY_BUF_SIZE, "写入设置文件失败, 流量阈值:%dKB", value);
     }
 
     bool isRefreezeEnable() const {

@@ -158,7 +158,7 @@ enum class MANAGER_CMD : uint32_t {
     setAppCfg = 21,      // send "package x\npackage x\npackage x\n..."
     setAppLabel = 22,    // send "uid label\nuid label\nuid label\n..."
     setSettingsVar = 23, // send bytes[2]: [0]index [1]value
-    setSettingsVar16 = 24, // send bytes[4]: [0]which(0=TCP订阅阈值,1=UDP) [1]保留 [2..3]值(u16小端)
+    setSettingsVar16 = 24, // send bytes[4]: [0]which(0=1秒流量阈值KB) [1]保留 [2..3]值(u16小端)
 
     // 其他命令 无附加数据 No additional data required
     clearLog = 61,       // return string: "log" //清理并返回log

@@ -447,10 +447,15 @@ public:
                 break;
             }
 
+            // [0] 字段类型（0=1 秒流量阈值 KB，旧版 1=UDP 报文阈值，已废弃）
             const int which = static_cast<uint8_t>(recvBuf[0]);
             const int value = static_cast<uint8_t>(recvBuf[2]) |
                               (static_cast<uint8_t>(recvBuf[3]) << 8);
-            int len = settings.setNetMinPayload(which, value, replyBuf.get());
+            int len;
+            if (which == 0 || which == 1)
+                len = settings.setNetStatThresholdKb(value, replyBuf.get());
+            else
+                len = snprintf(replyBuf.get(), REPLY_BUF_SIZE, "字段类型错误:%d", which);
             replyLen = len > 0 ? len : 0;
         } break;
 
