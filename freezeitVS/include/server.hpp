@@ -438,6 +438,22 @@ public:
             }
         } break;
 
+        case MANAGER_CMD::setSettingsVar16: {
+            replyPtr = replyBuf.get();
+
+            if (recvLen != 4) {
+                replyLen = snprintf(replyBuf.get(), REPLY_BUF_SIZE,
+                    "数据长度不正确, 正常:4, 收到:%d", recvLen);
+                break;
+            }
+
+            const int which = static_cast<uint8_t>(recvBuf[0]);
+            const int value = static_cast<uint8_t>(recvBuf[2]) |
+                              (static_cast<uint8_t>(recvBuf[3]) << 8);
+            int len = settings.setNetMinPayload(which, value, replyBuf.get());
+            replyLen = len > 0 ? len : 0;
+        } break;
+
         default: {
             replyPtr = "非法命令";
             replyLen = 12;

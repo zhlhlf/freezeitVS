@@ -33,8 +33,10 @@ private:
             0,  //[18] 
             1,  //[19]
             0,  //[20]
-            0,  //[21] Re:Kernel TCP 报文阈值索引
-            0,  //[22] Re:Kernel UDP 报文阈值索引
+            0,  //[21] Re:Kernel TCP 报文阈值 低字节
+            0,  //[22] Re:Kernel TCP 报文阈值 高字节
+            0,  //[23] Re:Kernel UDP 报文阈值 低字节
+            0,  //[24] Re:Kernel UDP 报文阈值 高字节
             0,  //[13]
             0,  //[24]
             0,  //[25]
@@ -53,13 +55,19 @@ private:
     // 最大索引
     static constexpr int refreezeTimeoutIdxMax = sizeof(refreezeTimeoutList) / sizeof(refreezeTimeoutList[0]) - 1;
 
-    // Re:Kernel 网络事件阈值。索引 0 表示用内核模块默认值（TCP 1024 / UDP 512）。
-    static constexpr int netMinPayloadTcpList[] = { 0, 512, 1024, 2048, 4096, 8192 };
-    static constexpr int netMinPayloadTcpIdxMax =
-        sizeof(netMinPayloadTcpList) / sizeof(netMinPayloadTcpList[0]) - 1;
-    static constexpr int netMinPayloadUdpList[] = { 0, 256, 512, 1024, 2048, 4096 };
-    static constexpr int netMinPayloadUdpIdxMax =
-        sizeof(netMinPayloadUdpList) / sizeof(netMinPayloadUdpList[0]) - 1;
+    // Re:Kernel 网络事件阈值（单位字节，0 表示用内核模块默认值 TCP 1024 / UDP 512）。
+    // 存成 u16 小端，占用 [21..22] 与 [23..24]。
+    static constexpr int NET_MIN_PAYLOAD_MAX = 20000;
+    static constexpr int NET_TCP_OFFSET = 21;
+    static constexpr int NET_UDP_OFFSET = 23;
+
+    static uint16_t readU16(const uint8_t* p) {
+        return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
+    }
+    static void writeU16(uint8_t* p, uint16_t v) {
+        p[0] = static_cast<uint8_t>(v & 0xFF);
+        p[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    }
 
     // 关闭, 5m, 15m, 30m, 1h, 2h
     static constexpr int wakeupTimeoutList[] = { 86400 * 365, 60 * 5, 60 * 15, 60 * 30, 3600, 3600 * 2 };
@@ -82,9 +90,6 @@ public:
     uint8_t& enableLMK = settingsVar[16];              // 调整 lmk 参数 仅安卓11-15
     uint8_t& enableDoze = settingsVar[17];             // 深度Doze
     //uint8_t& unknown = settingsVar[18];                // 
-
-    uint8_t& netMinPayloadTcpIdx = settingsVar[21]; // Re:Kernel TCP 报文阈值索引
-    uint8_t& netMinPayloadUdpIdx = settingsVar[22]; // Re:Kernel UDP 报文阈值索引
 
     uint8_t& enableDebug = settingsVar[30];        // 调试日志
 
@@ -169,11 +174,24 @@ public:
         return SETTINGS_SIZE;
     }
 
-    int getNetMinPayloadTcp() const {
-        return netMinPayloadTcpList[netMinPayloadTcpIdx <= netMinPayloadTcpIdxMax ? netMinPayloadTcpIdx : 0];
-    }
-    int getNetMinPayloadUdp() const {
-        return netMinPayloadUdpList[netMinPayloadUdpIdx <= netMinPayloadUdpIdxMax ? netMinPayloadUdpIdx : 0];
+    uint16_t getNetMinPayloadTcp() const { return readU16(settingsVar + NET_TCP_OFFSET); }
+    uint16_t getNetMinPayloadUdp() const { return readU16(settingsVar + NET_UDP_OFFSET); }
+
+    // which: 0=TCP, 1=UDP。value 单位字节，0 表示用内核默认值。
+    int setNetMinPayload(int which, int value, char* replyBuf) {
+        const size_t REPLY_BUF_SIZE = 2048;
+        if (value < 0 || value > NET_MIN_PAYLOAD_MAX)
+            return snprintf(replyBuf, REPLY_BUF_SIZE, "报文阈值超出范围 0-%d, 欲设为:%d",
+                NET_MIN_PAYLOAD_MAX, value);
+        if (which != 0 && which != 1)
+            return snprintf(replyBuf, REPLY_BUF_SIZE, "报文阈值类型错误:%d", which);
+
+        writeU16(settingsVar + (which == 0 ? NET_TCP_OFFSET : NET_UDP_OFFSET),
+                 static_cast<uint16_t>(value));
+        if (save())
+            return snprintf(replyBuf, REPLY_BUF_SIZE, "success");
+        return snprintf(replyBuf, REPLY_BUF_SIZE, "写入设置文件失败, %s阈值:%d",
+            which == 0 ? "TCP" : "UDP", value);
     }
 
     bool isRefreezeEnable() const {
@@ -248,18 +266,6 @@ public:
         case 17: // doze
         case 18: // xxx
         case 19: //
-        case 21: { // Re:Kernel TCP 阈值索引
-            if (val > netMinPayloadTcpIdxMax)
-                return snprintf(replyBuf, REPLY_BUF_SIZE, "TCP报文阈值参数错误, 欲设为:%d", val);
-        }
-        break;
-
-        case 22: { // Re:Kernel UDP 阈值索引
-            if (val > netMinPayloadUdpIdxMax)
-                return snprintf(replyBuf, REPLY_BUF_SIZE, "UDP报文阈值参数错误, 欲设为:%d", val);
-        }
-        break;
-
         case 20: //
         case 23: //
         case 24: //
