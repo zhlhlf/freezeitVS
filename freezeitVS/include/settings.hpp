@@ -33,10 +33,11 @@ private:
             0,  //[18] 
             1,  //[19]
             0,  //[20]
-            0,  //[21] Re:Kernel TCP 报文阈值 低字节
-            0,  //[22] Re:Kernel TCP 报文阈值 高字节
-            0,  //[23] Re:Kernel UDP 报文阈值 低字节
-            0,  //[24] Re:Kernel UDP 报文阈值 高字节
+            0x00, //[21] Re:Kernel TCP 报文阈值 低字节 (1024)
+            0x04, //[22] Re:Kernel TCP 报文阈值 高字节
+            0x00, //[23] Re:Kernel UDP 报文阈值 低字节 (512)
+            0x02, //[24] Re:Kernel UDP 报文阈值 高字节
+            0,  //[25] 报文阈值是否已初始化
             0,  //[13]
             0,  //[24]
             0,  //[25]
@@ -120,6 +121,17 @@ public:
             else {
                 memcpy(settingsVar, tmp, SETTINGS_SIZE);
 
+                // 老版本没有 Re:Kernel 阈值字段（全 0），补成默认 TCP 1024 / UDP 512。
+                // 用 [25] 做一次性标记，之后用户主动设成 0 不会被改回去。
+                if (settingsVar[25] != 1) {
+                    writeU16(settingsVar + NET_TCP_OFFSET, 1024);
+                    writeU16(settingsVar + NET_UDP_OFFSET, 512);
+                    settingsVar[25] = 1;
+                    settingsVar[0] = settingsVer;
+                    freezeit.log("已为旧设置补上 Re:Kernel 阈值默认值 TCP 1024B / UDP 512B");
+                    freezeit.log(save() ? "⚙️设置成功" : "🔧设置文件写入失败");
+                }
+
                 bool isError = false;
                 if (setMode > 2) {
                     isError = true;
@@ -188,6 +200,7 @@ public:
 
         writeU16(settingsVar + (which == 0 ? NET_TCP_OFFSET : NET_UDP_OFFSET),
                  static_cast<uint16_t>(value));
+        settingsVar[25] = 1; // 已初始化标记
         if (save())
             return snprintf(replyBuf, REPLY_BUF_SIZE, "success");
         return snprintf(replyBuf, REPLY_BUF_SIZE, "写入设置文件失败, %s阈值:%d",
